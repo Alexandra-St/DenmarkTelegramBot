@@ -95,12 +95,26 @@ _PUBLIC_ROUTE_TYPES = {
 
 
 def _public_case_url(sag: Sag) -> str | None:
-    route = _PUBLIC_ROUTE_TYPES.get(sag.sagstype or "")
-    number = re.fullmatch(r"\s*([LBF])\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
-    if (route is None or number is None or number.group(1).upper() != route[1]
-            or not re.fullmatch(r"\d{5}", sag.periode_code or "")):
+    if not re.fullmatch(r"\d{5}", sag.periode_code or ""):
         return None
-    return f"https://www.ft.dk/samling/{sag.periode_code}/{route[0]}/{route[1].lower()}{number.group(2)}/index.htm"
+    sagtype = sag.sagstype or ""
+    if sagtype in _PUBLIC_ROUTE_TYPES:
+        route, prefix = _PUBLIC_ROUTE_TYPES[sagtype]
+        number = re.fullmatch(r"\s*([LBF])\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
+        if number is None or number.group(1).upper() != prefix:
+            return None
+        return f"https://www.ft.dk/samling/{sag.periode_code}/{route}/{prefix.lower()}{number.group(2)}/index.htm"
+    if sagtype == "§ 20-spørgsmål":
+        number = re.fullmatch(r"\s*S\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
+        if number is None:
+            return None
+        return f"https://www.ft.dk/samling/{sag.periode_code}/spoergsmaal/S{number.group(1)}/index.htm"
+    if sagtype == "Aktstykke":
+        number = re.fullmatch(r"\s*Aktstk\.\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
+        if number is None:
+            return None
+        return f"https://www.ft.dk/samling/{sag.periode_code}/aktstykke/aktstk.{number.group(1)}/index.htm"
+    return None
 
 
 def assemble_cases(

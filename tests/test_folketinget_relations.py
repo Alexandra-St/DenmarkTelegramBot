@@ -131,13 +131,54 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(result.cases[0].source_url, f"{ODA_ROOT}Sag(2)")
         self.assertEqual([item.id for item in result.cases[0].stages], [1, 8])
 
-    def test_public_case_url_uses_confirmed_session_type_and_number_only(self) -> None:
+    def test_existing_public_case_routes_keep_their_confirmed_patterns(self) -> None:
+        expected = {
+            "Lovforslag": ("L 1", "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm"),
+            "Beslutningsforslag": ("B 1", "https://www.ft.dk/samling/20251/beslutningsforslag/b1/index.htm"),
+            "Forespørgsel": ("F 1", "https://www.ft.dk/samling/20251/forespoergsel/f1/index.htm"),
+        }
+        for sagstype, (number, url) in expected.items():
+            with self.subTest(sagstype=sagstype):
+                source = replace(sag(1), periode_code="20251", sagstype=sagstype, nummer=number)
+                self.assertEqual(assemble_cases([source]).cases[0].public_url, url)
+
+    def test_public_case_url_requires_a_valid_confirmed_session(self) -> None:
         source = replace(sag(1), periode_code="20251", sagstype="Lovforslag")
-        result = assemble_cases([source])
-        self.assertEqual(result.cases[0].public_url, "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm")
         self.assertIsNone(assemble_cases([replace(source, periode_code=None)]).cases[0].public_url)
+        self.assertIsNone(assemble_cases([replace(source, periode_code="2025")]).cases[0].public_url)
         self.assertIsNone(assemble_cases([replace(source, sagstype="Unknown type")]).cases[0].public_url)
         self.assertIsNone(assemble_cases([replace(source, nummer="FIU alm. del")]).cases[0].public_url)
+
+    def test_public_case_url_supports_strict_s20_number_format(self) -> None:
+        source = replace(sag(1), periode_code="20141", sagstype="§ 20-spørgsmål", nummer="S 601")
+        self.assertEqual(
+            assemble_cases([source]).cases[0].public_url,
+            "https://www.ft.dk/samling/20141/spoergsmaal/S601/index.htm",
+        )
+        another = replace(source, nummer="S 7")
+        self.assertEqual(
+            assemble_cases([another]).cases[0].public_url,
+            "https://www.ft.dk/samling/20141/spoergsmaal/S7/index.htm",
+        )
+        for number in ("F 601", "S 601 A", "question 601", None):
+            with self.subTest(number=number):
+                self.assertIsNone(assemble_cases([replace(source, nummer=number)]).cases[0].public_url)
+
+    def test_public_case_url_supports_observed_aktstykke_number_format(self) -> None:
+        source = replace(sag(1), periode_code="20241", sagstype="Aktstykke", nummer="Aktstk. 176")
+        self.assertEqual(
+            assemble_cases([source]).cases[0].public_url,
+            "https://www.ft.dk/samling/20241/aktstykke/aktstk.176/index.htm",
+        )
+        for number in ("Aktstykke 176", "Aktstk. 176 A", "176", None):
+            with self.subTest(number=number):
+                self.assertIsNone(assemble_cases([replace(source, nummer=number)]).cases[0].public_url)
+
+    def test_other_unsupported_sag_types_still_have_no_public_route(self) -> None:
+        source = replace(sag(1), periode_code="20251", nummer="V 12")
+        for sagstype in ("Forslag til vedtagelse", "Redegørelse", "Kommissionsforslag", "Rådsmøde"):
+            with self.subTest(sagstype=sagstype):
+                self.assertIsNone(assemble_cases([replace(source, sagstype=sagstype)]).cases[0].public_url)
 
     def test_orphan_stage_and_link_remain_structured_diagnostics(self) -> None:
         result = assemble_cases([sag(1)], stages=[stage(2, 99)], document_links=[link(3, 99, 7)])
