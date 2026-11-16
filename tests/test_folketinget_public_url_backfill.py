@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.backfill_folketinget_public_urls import (
-    MANIFEST_SCHEMA, RouteResolution, WranglerD1Store, apply_manifest,
-    build_manifest, dry_run, rollback_manifest,
+    MANIFEST_SCHEMA, MANIFEST_VERSION, RouteResolution, WranglerD1Store, apply_manifest,
+    build_manifest, dry_run, resolve_oda_routes, rollback_manifest, validate_manifest,
 )
 
 PUBLIC_URL = "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm"
@@ -83,15 +84,38 @@ class BackfillTests(unittest.TestCase):
         self.assertEqual(manifest["records"][0]["public_url"], PUBLIC_URL)
         self.assertEqual(manifest["records"][0]["oda_audit"]["periode_code"], "20251")
 
-    def test_unsupported_or_incomplete_routes_are_skipped_with_reason(self):
+    def test_skipped_records_keep_publication_sag_id_reason_and_metadata(self):
         rows = [publication(1, "42"), publication(2, "43")]
         manifest = build_manifest(rows, {
-            "42": RouteResolution(None, "unsupported_sagstype"),
-            "43": RouteResolution(None, "missing_invalid_periode"),
+            "42": RouteResolution(None, "unsupported_sagstype", {"sag_id": 42, "sagstype": "§ 20-spørgsmål", "number": "S 4"}),
+            "43": RouteResolution(None, "missing_periodeid", {"sag_id": 43, "periode_id": None}),
         })
         self.assertEqual(manifest["records"], [])
-        self.assertEqual(manifest["skipped_by_reason"], {"missing_invalid_periode": 1, "unsupported_sagstype": 1})
+        self.assertEqual(manifest["skipped_by_reason"], {"missing_periodeid": 1, "unsupported_sagstype": 1})
         self.assertEqual(manifest["summary"]["remaining_without_public_url"], 2)
+        skipped = {item["external_id"]: item for item in manifest["skipped_records"]}
+        self.assertEqual(skipped["42"]["publication_id"], 1)
+        self.assertEqual(skipped["42"]["reason"], "unsupported_sagstype")
+        self.assertEqual(skipped["42"]["source_metadata"], json.loads(ORIGINAL))
+        self.assertEqual(skipped["42"]["oda_audit"]["sagstype"], "§ 20-spørgsmål")
+        self.assertEqual(manifest["summary"]["skipped"], len(manifest["skipped_records"]))
+        self.assertEqual(sum(manifest["skipped_by_reason"].values()), len(manifest["skipped_records"]))
+
+    def test_missing_periode_id_and_missing_periode_entity_are_distinct(self):
+        rows = [publication(1, "42"), publication(2, "43")]
+        manifest = build_manifest(rows, {
+            "42": RouteResolution(None, "missing_periodeid", {"sag_id": 42, "periode_id": None}),
+            "43": RouteResolution(None, "periode_not_found", {"sag_id": 43, "periode_id": 7, "periode_found": False}),
+        })
+        self.assertEqual(manifest["skipped_by_reason"], {"missing_periodeid": 1, "periode_not_found": 1})
+        self.assertEqual([item["oda_audit"]["periode_id"] for item in manifest["skipped_records"]], [None, 7])
+
+    def test_missing_and_empty_numbers_have_distinct_skip_reasons(self):
+        manifest = build_manifest([publication(1, "42"), publication(2, "43")], {
+            "42": RouteResolution(None, "missing_number", {"number": None}),
+            "43": RouteResolution(None, "empty_number", {"number": "  "}),
+        })
+        self.assertEqual(manifest["skipped_by_reason"], {"empty_number": 1, "missing_number": 1})
 
     def test_existing_public_url_is_counted_and_not_replanned(self):
         existing = json.dumps({"number": "L 1", "public_url": PUBLIC_URL})
@@ -186,6 +210,67 @@ class BackfillTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_manifest(unsafe, store)
         self.assertEqual(store.publication_writes, 0)
+
+    def test_failed_bulk_sag_lookup_recovers_once_with_singleton_fallback(self):
+        from collectors.folketinget_models import Diagnostic
+
+        calls = []
+        sag = {"id": 42, "nummer": "B 7", "titel": "Case", "typeid": 5, "kategoriid": 15,
+               "statusid": 1, "periodeid": 9, "opdateringsdato": None}
+
+        def fake_bulk(_client, collection, _field, mapping, *, workers, batch_size):
+            calls.append((collection, tuple(mapping), batch_size))
+            if collection == "Sag" and batch_size == 40:
+                return [], [Diagnostic("related_page_failed", "Sag", "bulk relationship lookup failed (HTTP_400:page=1)", 42)], False
+            if collection == "Sag":
+                return [sag], [], True
+            if collection == "Periode":
+                return [{"id": 9, "kode": "20251", "type": "samling"}], [], True
+            if collection == "Sagstype":
+                return [{"id": 5, "type": "Beslutningsforslag"}], [], True
+            raise AssertionError(collection)
+
+        with patch("collectors.folketinget_relations._bulk_scan_groups", side_effect=fake_bulk):
+            result = resolve_oda_routes([publication(external_id="42")], client=object())
+        self.assertEqual(result["42"].public_url, "https://www.ft.dk/samling/20251/beslutningsforslag/b7/index.htm")
+        self.assertIn(("Sag", (42,), 1), calls)
+        self.assertEqual(sum(1 for collection, *_ in calls if collection == "Sag"), 2)
+
+    def test_failed_fallback_stays_skipped_with_bounded_lookup_diagnostic(self):
+        from collectors.folketinget_models import Diagnostic
+
+        calls = []
+
+        def fake_bulk(_client, collection, _field, mapping, *, workers, batch_size):
+            calls.append((collection, batch_size))
+            return [], [Diagnostic("related_page_failed", collection, "bulk relationship lookup failed (cursor_not_advanced:page=2)", 42)], False
+
+        with patch("collectors.folketinget_relations._bulk_scan_groups", side_effect=fake_bulk):
+            result = resolve_oda_routes([publication(external_id="42")], client=object())
+        self.assertEqual(result["42"].reason, "oda_lookup_failed")
+        self.assertEqual(result["42"].diagnostic["collection"], "Sag")
+        self.assertEqual(result["42"].diagnostic["failure_type"], "pagination_cursor_failure")
+        self.assertEqual([batch_size for collection, batch_size in calls if collection == "Sag"], [40, 1])
+
+    def test_skipped_records_never_participate_in_apply(self):
+        rows = [publication(1, "42"), publication(2, "43")]
+        manifest = build_manifest(rows, {
+            "42": RouteResolution(PUBLIC_URL),
+            "43": RouteResolution(None, "unsupported_sagstype", {"sagstype": "§ 20-spørgsmål"}),
+        })
+        self.assertEqual(len(manifest["records"]), 1)
+        self.assertEqual(len(manifest["skipped_records"]), 1)
+        store = FakeStore(rows)
+        self.assertEqual(apply_manifest(manifest, store), {"applied": 1})
+        self.assertEqual(store.publication_writes, 1)
+        self.assertNotIn("public_url", json.loads(store.get_publication(2)["source_metadata_json"]))
+
+    def test_old_manifest_version_is_rejected(self):
+        manifest = build_manifest([], {})
+        self.assertEqual(manifest["version"], MANIFEST_VERSION)
+        manifest["version"] = 1
+        with self.assertRaisesRegex(ValueError, "unsupported backfill manifest schema"):
+            validate_manifest(manifest)
 
 
 if __name__ == "__main__":

@@ -20,13 +20,15 @@ from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_SCHEMA = "denmarktgbot.folketinget-public-url-backfill"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 APPLY_BATCH_SIZE = 25
 _SAG_ID = re.compile(r"^[1-9]\d{0,19}$")
 _ALLOWED_SKIP_REASONS = frozenset({
     "invalid_metadata", "missing_sag_id", "oda_lookup_failed", "missing_sag",
-    "missing_invalid_periode", "unsupported_sagstype", "missing_invalid_number",
-    "route_validation_failure",
+    "missing_periodeid", "periode_not_found", "invalid_periode_code",
+    "unsupported_sagstype", "sagstype_not_found", "missing_sagstype_id",
+    "missing_number", "empty_number", "route_invalid_number",
+    "number_type_mismatch", "route_validation_failure",
 })
 
 
@@ -56,6 +58,83 @@ class RouteResolution:
     public_url: str | None
     reason: str | None = None
     audit: Mapping[str, object] | None = None
+    diagnostic: Mapping[str, str] | None = None
+
+
+def _diagnostic_failure(message: str) -> tuple[str, str]:
+    """Map bounded ODA diagnostics to a small, stable set of safe labels."""
+    detail = message.strip()[:240]
+    lowered = detail.lower()
+    if re.search(r"\bHTTP_\d+\b|\bHTTP_error\b", detail):
+        return "request_http_failure", detail
+    if any(token in lowered for token in ("cursor", "pagination", "page_limit", "upper_bound", "page=")):
+        return "pagination_cursor_failure", detail
+    return "other_read_failure", detail
+
+
+def _bulk_scan_with_bounded_fallback(
+    client: Any, collection: str, field: str, mapping: Mapping[int, set[int]],
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Retry only IDs from failed groups, once, as singleton read-only scans."""
+    from collectors.folketinget_relations import _bulk_scan_groups
+
+    rows, diagnostics, _ = _bulk_scan_groups(client, collection, field, mapping, workers=4, batch_size=40)
+    failed_sags = {item.entity_id for item in diagnostics if item.entity_id is not None}
+    if not failed_sags:
+        return rows, []
+    retry_mapping = {
+        key: set(sag_ids) for key, sag_ids in mapping.items()
+        if set(sag_ids).intersection(failed_sags)
+    }
+    if not retry_mapping:
+        return rows, diagnostics
+    retry_rows, retry_diagnostics, _ = _bulk_scan_groups(
+        client, collection, field, retry_mapping, workers=4, batch_size=1,
+    )
+    # Partial rows from failed scans are retained; dedup by ODA entity ID.
+    by_id: dict[int, dict[str, Any]] = {}
+    for row in [*rows, *retry_rows]:
+        identifier = row.get("id")
+        if isinstance(identifier, int) and not isinstance(identifier, bool):
+            by_id[identifier] = row
+    return list(by_id.values()), retry_diagnostics
+
+
+def _hydrate_route_fields(client: Any, sags: Sequence[Any]) -> tuple[list[Any], dict[int, list[dict[str, str]]], set[int], set[int]]:
+    from dataclasses import replace
+
+    periods = {item.periodeid: {item.id} for item in sags if item.periodeid is not None}
+    types = {item.typeid: {item.id} for item in sags if item.typeid is not None}
+    period_rows, period_diagnostics = _bulk_scan_with_bounded_fallback(client, "Periode", "id", periods) if periods else ([], [])
+    type_rows, type_diagnostics = _bulk_scan_with_bounded_fallback(client, "Sagstype", "id", types) if types else ([], [])
+    period_by_id = {row.get("id"): row for row in period_rows if isinstance(row.get("id"), int)}
+    type_by_id = {row.get("id"): row for row in type_rows if isinstance(row.get("id"), int)}
+    period_failed = {item.entity_id: item.message for item in period_diagnostics if item.entity_id is not None}
+    type_failed = {item.entity_id: item.message for item in type_diagnostics if item.entity_id is not None}
+    lookup_by_sag: dict[int, list[dict[str, str]]] = {}
+    hydrated = []
+    for sag in sags:
+        period = period_by_id.get(sag.periodeid)
+        sagtype = type_by_id.get(sag.typeid)
+        code = period.get("kode") if period and period.get("type") == "samling" else None
+        name = sagtype.get("type") if sagtype else None
+        hydrated.append(replace(
+            sag,
+            periode_code=code if isinstance(code, str) and re.fullmatch(r"\d{5}", code) else None,
+            sagstype=name if isinstance(name, str) else None,
+        ))
+        problems: list[tuple[str, str]] = []
+        if sag.id in period_failed:
+            problems.append(("Periode", period_failed[sag.id]))
+        if sag.id in type_failed:
+            problems.append(("Sagstype", type_failed[sag.id]))
+        if problems:
+            lookup_by_sag[sag.id] = [
+                {"collection": collection, "failure_type": _diagnostic_failure(message)[0],
+                 "detail": _diagnostic_failure(message)[1]}
+                for collection, message in problems
+            ]
+    return hydrated, lookup_by_sag, set(period_by_id), set(type_by_id)
 
 
 class WranglerD1Store:
@@ -161,9 +240,7 @@ def resolve_oda_routes(
     """Read only Sag rows plus their Periode/Sagstype lookups for candidate IDs."""
     from collectors.folketinget import ODataClient
     from collectors.folketinget_models import Sag, normalize_many
-    from collectors.folketinget_relations import (
-        _PUBLIC_ROUTE_TYPES, _bulk_scan_groups, _enrich_public_route_fields, _public_case_url,
-    )
+    from collectors.folketinget_relations import _PUBLIC_ROUTE_TYPES, _public_case_url
 
     validator = _load_url_validator()
     candidates: dict[str, Mapping[str, Any]] = {}
@@ -177,41 +254,60 @@ def resolve_oda_routes(
 
     odata = client or ODataClient()
     ids = {int(item): {int(item)} for item in candidates}
-    raw_sags, diagnostics, _ = _bulk_scan_groups(odata, "Sag", "id", ids, workers=4, batch_size=40)
+    raw_sags, diagnostics = _bulk_scan_with_bounded_fallback(odata, "Sag", "id", ids)
     normalized = normalize_many(raw_sags, "Sag")
     sags = [item for item in (normalized.record or ()) if isinstance(item, Sag)]
     failed_ids = {str(item.entity_id) for item in diagnostics if item.entity_id is not None}
-    hydrated = _enrich_public_route_fields(odata, sags, workers=4, batch_size=40)
+    hydrated, lookup_failures, found_period_ids, found_type_ids = _hydrate_route_fields(odata, sags)
     by_id = {str(item.id): item for item in hydrated}
 
     resolutions: dict[str, RouteResolution] = {}
     for external_id in candidates:
         if external_id in failed_ids:
-            resolutions[external_id] = RouteResolution(None, "oda_lookup_failed")
+            messages = [item.message for item in diagnostics if str(item.entity_id) == external_id]
+            failure_type, detail = _diagnostic_failure(messages[0] if messages else "Sag read failed")
+            resolutions[external_id] = RouteResolution(
+                None, "oda_lookup_failed", diagnostic={"collection": "Sag", "failure_type": failure_type, "detail": detail},
+            )
             continue
         sag = by_id.get(external_id)
         if sag is None:
-            resolutions[external_id] = RouteResolution(None, "missing_sag")
+            resolutions[external_id] = RouteResolution(
+                None, "missing_sag",
+                diagnostic={"collection": "Sag", "failure_type": "complete_read_no_match", "detail": "completed ODA lookup returned no Sag row"},
+            )
             continue
         audit = {
             "sag_id": sag.id, "number": sag.nummer, "type_id": sag.typeid,
             "sagstype": sag.sagstype, "periode_id": sag.periodeid,
             "periode_code": sag.periode_code,
+            "periode_found": sag.periodeid in found_period_ids if sag.periodeid is not None else False,
+            "sagstype_found": sag.typeid in found_type_ids if sag.typeid is not None else False,
         }
-        if not isinstance(sag.periode_code, str) or not re.fullmatch(r"\d{5}", sag.periode_code):
-            reason = "missing_invalid_periode"
-        elif not isinstance(sag.nummer, str) or not sag.nummer.strip():
-            reason = "missing_invalid_number"
+        if sag.id in lookup_failures:
+            diagnostic = lookup_failures[sag.id][0]
+            resolutions[external_id] = RouteResolution(None, "oda_lookup_failed", audit, diagnostic)
+            continue
+        if sag.periodeid is None:
+            reason = "missing_periodeid"
+        elif not isinstance(sag.periode_code, str) or not re.fullmatch(r"\d{5}", sag.periode_code):
+            reason = "periode_not_found" if not audit["periode_found"] else "invalid_periode_code"
+        elif sag.nummer is None:
+            reason = "missing_number"
+        elif not sag.nummer.strip():
+            reason = "empty_number"
         elif sag.sagstype not in _PUBLIC_ROUTE_TYPES:
-            reason = "unsupported_sagstype"
+            reason = "missing_sagstype_id" if sag.typeid is None else ("sagstype_not_found" if not audit["sagstype_found"] else "unsupported_sagstype")
         else:
             url = _public_case_url(sag)
             validated = validator(url)
             if validated:
                 resolutions[external_id] = RouteResolution(validated, audit=audit)
                 continue
-            reason = "route_validation_failure"
-        resolutions[external_id] = RouteResolution(None, reason, audit)
+            number = re.fullmatch(r"\s*([LBF])\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
+            route_prefix = _PUBLIC_ROUTE_TYPES.get(sag.sagstype or "", ("", ""))[1]
+            reason = "route_invalid_number" if number is None else ("number_type_mismatch" if number.group(1).upper() != route_prefix else "route_validation_failure")
+        resolutions[external_id] = RouteResolution(None, reason, audit, {"detail": reason})
     return resolutions
 
 
@@ -224,40 +320,59 @@ def build_manifest(
     folketinget = [row for row in publications if row.get("source_code") == "folketinget"]
     already = 0
     candidates: list[Mapping[str, Any]] = []
-    skipped: Counter[str] = Counter()
+    skipped_records: list[dict[str, Any]] = []
     for row in folketinget:
         metadata = _json_object(row.get("source_metadata_json"))
         if metadata is None:
-            skipped["invalid_metadata"] += 1
+            candidates.append(row)
+            continue
         elif "public_url" in metadata:
             already += 1
         elif not isinstance(row.get("external_id"), str) or not _SAG_ID.fullmatch(row["external_id"]):
-            skipped["missing_sag_id"] += 1
+            candidates.append(row)
         else:
             candidates.append(row)
 
     validator = _load_url_validator()
     records: list[dict[str, Any]] = []
+    skipped: Counter[str] = Counter()
     for row in candidates:
         external_id = str(row["external_id"])
+        metadata = _json_object(row.get("source_metadata_json"))
+        publication_id = row.get("publication_id")
         resolution = resolutions.get(external_id)
-        if resolution is None:
-            skipped["missing_sag"] += 1
-            continue
-        if resolution.public_url is None:
+        reason: str | None = None
+        if metadata is None:
+            reason = "invalid_metadata"
+        elif not isinstance(row.get("external_id"), str) or not _SAG_ID.fullmatch(str(row.get("external_id"))):
+            reason = "missing_sag_id"
+        elif resolution is None:
+            reason = "missing_sag"
+        elif resolution.public_url is None:
             reason = resolution.reason if resolution.reason in _ALLOWED_SKIP_REASONS else "route_validation_failure"
+        if reason:
             skipped[reason] += 1
+            skipped_records.append({
+                "publication_id": publication_id if isinstance(publication_id, int) and not isinstance(publication_id, bool) else None,
+                "external_id": row.get("external_id"),
+                "reason": reason,
+                "source_metadata": metadata,
+                "oda_audit": dict(resolution.audit or {}) if resolution and resolution.audit else {},
+                "diagnostic": dict(resolution.diagnostic or {"detail": reason}) if resolution else {"detail": reason},
+            })
             continue
+        assert resolution is not None
         url = validator(resolution.public_url)
         original = row.get("source_metadata_json")
         metadata = _json_object(original)
-        publication_id = row.get("publication_id")
         external_url = row.get("external_url")
         if not url or metadata is None:
             skipped["route_validation_failure"] += 1
+            skipped_records.append({"publication_id": publication_id, "external_id": row.get("external_id"), "reason": "route_validation_failure", "source_metadata": metadata, "oda_audit": dict(resolution.audit or {}), "diagnostic": {"detail": "manifest URL or source metadata failed validation"}})
             continue
         if isinstance(publication_id, bool) or not isinstance(publication_id, int) or publication_id <= 0 or not isinstance(external_url, str):
             skipped["route_validation_failure"] += 1
+            skipped_records.append({"publication_id": publication_id if isinstance(publication_id, int) and not isinstance(publication_id, bool) else None, "external_id": row.get("external_id"), "reason": "route_validation_failure", "source_metadata": metadata, "oda_audit": dict(resolution.audit or {}), "diagnostic": {"detail": "publication identity or external URL failed validation"}})
             continue
         records.append({
             "publication_id": publication_id,
@@ -271,14 +386,30 @@ def build_manifest(
 
     total = len(folketinget)
     planned = len(records)
+    skipped_by_sagstype = Counter(
+        str(item.get("oda_audit", {}).get("sagstype") or "<missing>")
+        for item in skipped_records if item["reason"] == "unsupported_sagstype"
+    )
+    skipped_by_lookup: Counter[str] = Counter()
+    for item in skipped_records:
+        if item["reason"] == "oda_lookup_failed":
+            diagnostic = item.get("diagnostic", {})
+            skipped_by_lookup[f"{diagnostic.get('collection', 'unknown')}:{diagnostic.get('failure_type', 'other_read_failure')}"] += 1
     summary = {
         "total_folketinget_publications": total,
         "already_have_public_url": already,
-        "candidates_checked": len(candidates),
+        "candidates_checked": sum(
+            1 for row in candidates
+            if _json_object(row.get("source_metadata_json")) is not None
+            and isinstance(row.get("external_id"), str)
+            and _SAG_ID.fullmatch(row["external_id"])
+        ),
         "backfillable": planned,
         "skipped": sum(skipped.values()),
         "planned_updates": planned,
         "remaining_without_public_url": total - already - planned,
+        "skipped_by_sagstype": dict(sorted(skipped_by_sagstype.items())),
+        "skipped_by_lookup_failure": dict(sorted(skipped_by_lookup.items())),
     }
     return {
         "schema": MANIFEST_SCHEMA,
@@ -286,6 +417,7 @@ def build_manifest(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "summary": summary,
         "skipped_by_reason": dict(sorted(skipped.items())),
+        "skipped_records": skipped_records,
         "records": records,
     }
 
@@ -296,6 +428,9 @@ def validate_manifest(value: object) -> dict[str, Any]:
     records = value.get("records")
     if not isinstance(records, list):
         raise ValueError("manifest records must be a list")
+    skipped_records = value.get("skipped_records")
+    if not isinstance(skipped_records, list):
+        raise ValueError("manifest skipped_records must be a list")
     validator = _load_url_validator()
     seen: set[int] = set()
     for row in records:
