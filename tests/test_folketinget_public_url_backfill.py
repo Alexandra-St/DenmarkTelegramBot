@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -199,6 +200,50 @@ class BackfillTests(unittest.TestCase):
             self.assertNotRegex(statement, r"(?i)UPDATE\s+(publication_events|notifications|source_states|ingestion_runs)")
         self.assertIn("json_set(source_metadata_json", statements[0])
         self.assertIn("json_remove(source_metadata_json", statements[1])
+
+    def test_wrangler_invocation_uses_worker_context_from_arbitrary_cwd(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"results": []}]), stderr="")
+
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            os.chdir(directory)
+            try:
+                WranglerD1Store(runner=runner)._execute("SELECT 1 AS ok")
+            finally:
+                os.chdir(original_cwd)
+
+        args, kwargs = calls[0]
+        expected_worker = Path(__file__).resolve().parents[1] / "worker"
+        self.assertEqual(kwargs["cwd"], expected_worker)
+        self.assertEqual(args[:3], ["npx", "--no-install", "wrangler"])
+        self.assertIn("--remote", args)
+        self.assertIn("--json", args)
+        config = Path(args[args.index("--config") + 1])
+        self.assertEqual(config, expected_worker / "wrangler.jsonc")
+        self.assertTrue(config.is_absolute())
+
+    def test_wrangler_failure_reports_redacted_stderr_and_exit_code(self):
+        def runner(_args, **_kwargs):
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr=(
+                    "D1 failed: CLOUDFLARE_API_TOKEN=topsecret "
+                    "Authorization: Bearer oauth-secret access_token=another-secret"
+                ),
+            )
+
+        with self.assertRaises(RuntimeError) as raised:
+            WranglerD1Store(runner=runner)._execute("SELECT 1")
+        message = str(raised.exception)
+        self.assertIn("exit 1", message)
+        self.assertIn("D1 failed", message)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn("topsecret", message)
+        self.assertNotIn("oauth-secret", message)
+        self.assertNotIn("another-secret", message)
 
     def test_invalid_source_or_manifest_url_is_rejected_before_write(self):
         rows = [publication()]

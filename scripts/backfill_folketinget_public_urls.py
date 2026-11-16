@@ -7,9 +7,10 @@ Apply and rollback require an existing manifest and never call ingestion APIs.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import re
-import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -51,6 +52,50 @@ def _load_url_validator() -> Callable[[object], str | None]:
     # of truth for URLs written to D1.
     from collectors.ingestion_client import _validated_folketinget_public_url
     return _validated_folketinget_public_url
+
+
+def _safe_stderr(stderr: object) -> str:
+    if not isinstance(stderr, str):
+        return ""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", stderr).strip()
+    text = re.sub(
+        r"(?i)([\"']?(?:CLOUDFLARE_API_TOKEN|CF_API_TOKEN|[A-Z0-9_ -]*TOKEN|CLIENT[_ -]?SECRET)[\"']?\s*[=:]\s*[\"']?)([^\"'\s,;}]+)([\"']?)",
+        r"\1[redacted]\3", text,
+    )
+    text = re.sub(r"(?i)(authorization\s*:\s*bearer\s+)\S+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(\bbearer\s+)\S+", r"\1[redacted]", text)
+    return text[:800]
+
+
+def _run_wrangler_interactive(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run Wrangler on a PTY when launched from a terminal, preserving OAuth mode."""
+    import pty
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(cwd)
+            os.execvp(command[0], list(command))
+        except BaseException:
+            os._exit(127)
+
+    chunks: list[bytes] = []
+    try:
+        while True:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(master_fd)
+    _, status = os.waitpid(pid, 0)
+    returncode = os.waitstatus_to_exitcode(status)
+    return subprocess.CompletedProcess(command, returncode, b"".join(chunks).decode(errors="replace"), "")
 
 
 @dataclass(frozen=True)
@@ -145,21 +190,26 @@ class WranglerD1Store:
         database: str = "denmarktgbot-db",
         config: Path | None = None,
         *,
-        runner: Callable[..., Any] = subprocess.run,
+        runner: Callable[..., Any] | None = None,
     ) -> None:
         self.database = database
         self.config = config or ROOT / "worker" / "wrangler.jsonc"
         self.runner = runner
-        local = ROOT / "worker" / "node_modules" / ".bin" / "wrangler"
-        self.wrangler = str(local) if local.exists() else (shutil.which("wrangler") or "wrangler")
+        self.wrangler = ["npx", "--no-install", "wrangler"]
 
     def _execute(self, sql: str) -> dict[str, Any]:
-        completed = self.runner(
-            [self.wrangler, "d1", "execute", self.database, "--remote", "--config", str(self.config), "--json", "--command", sql],
-            cwd=ROOT / "worker", capture_output=True, text=True, check=False,
-        )
+        worker_dir = ROOT / "worker"
+        command = [*self.wrangler, "d1", "execute", self.database, "--remote", "--config", str(self.config), "--json", "--command", sql]
+        if self.runner is not None:
+            completed = self.runner(command, cwd=worker_dir, capture_output=True, text=True, check=False)
+        elif sys.stdin.isatty() and sys.stdout.isatty():
+            completed = _run_wrangler_interactive(command, worker_dir)
+        else:
+            completed = subprocess.run(command, cwd=worker_dir, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
-            raise RuntimeError(f"Wrangler D1 command failed (exit {completed.returncode})")
+            diagnostic = _safe_stderr(completed.stderr or completed.stdout)
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise RuntimeError(f"Wrangler D1 command failed (exit {completed.returncode}){suffix}")
         output = completed.stdout.strip()
         payload: Any = None
         for index, char in enumerate(output):
