@@ -41,6 +41,9 @@ class Sag:
     updated_at_utc: str | None
     retsinformationsurl: str | None
     complete: bool = True
+    periodeid: int | None = None
+    periode_code: str | None = None
+    sagstype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +168,7 @@ class LegislativeCase:
     documents: tuple[CaseDocument, ...]
     votes: tuple[CaseVote, ...]
     complete: bool
+    public_url: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -282,6 +286,8 @@ def _normalize(raw: Mapping[str, object], entity: str) -> NormalizationResult[ob
             raw.get("opdateringsdato"), entity=entity, diagnostics=diagnostics, entity_id=entity_id
         )
         if entity == "Sag":
+            raw_periode_id = raw.get("periodeid")
+            periode_id = raw_periode_id if isinstance(raw_periode_id, int) and not isinstance(raw_periode_id, bool) and raw_periode_id > 0 else None
             record = Sag(
                 entity_id,
                 _text(raw.get("nummer"), field="nummer", entity=entity, diagnostics=diagnostics, entity_id=entity_id),
@@ -293,6 +299,7 @@ def _normalize(raw: Mapping[str, object], entity: str) -> NormalizationResult[ob
                 utc,
                 _text(raw.get("retsinformationsurl"), field="retsinformationsurl", entity=entity, diagnostics=diagnostics, entity_id=entity_id),
                 timestamp_valid and not diagnostics,
+                periode_id,
             )
         elif entity == "Sagstrin":
             parent_id = _identifier(raw.get("sagid"), field="sagid", nullable=False, entity=entity, diagnostics=diagnostics, entity_id=entity_id)

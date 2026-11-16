@@ -4,9 +4,9 @@ import unittest
 from threading import Barrier, BrokenBarrierError, Lock
 from unittest.mock import patch
 
-from collectors.folketinget import Cursor, ODataClient, ODataPageError, ODataPaginationError, ScanMetadata, ScanResult
+from collectors.folketinget import COLLECTIONS, Cursor, ODataClient, ODataPageError, ODataPaginationError, ScanMetadata, ScanResult
 from collectors.folketinget_relations import BulkHydrationResult
-from collectors.folketinget_sync import _affected_cases, _page_failure_category, _scan, collect, parse_checkpoints
+from collectors.folketinget_sync import _STREAM_SELECT, _affected_cases, _page_failure_category, _scan, collect, parse_checkpoints
 
 STAMP = "2026-10-14T08:46:08.6566667"
 
@@ -64,9 +64,15 @@ class SyncTests(unittest.TestCase):
             parse_checkpoints({"Sag": {"timestamp": "yesterday", "id": 10}})
         with self.assertRaises(ValueError):
             parse_checkpoints({"Unknown": {"timestamp": STAMP, "id": 10}})
+        for lookup in ("Periode", "Sagstype"):
+            self.assertIn(lookup, COLLECTIONS)
+            with self.assertRaises(ValueError):
+                parse_checkpoints({lookup: {"timestamp": STAMP, "id": 10}})
 
     def test_six_stream_scans_use_bounded_parallel_workers_and_required_projections(self):
-        streams = {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"}
+        streams = set(_STREAM_SELECT)
+        self.assertEqual(len(streams), 6)
+        self.assertTrue({"Periode", "Sagstype"}.issubset(COLLECTIONS))
         rendezvous = Barrier(4)
         lock = Lock()
         first_stream_calls = 0
@@ -93,6 +99,7 @@ class SyncTests(unittest.TestCase):
             result = collect(ParallelClient(), mode="historical", max_workers=4)
         self.assertTrue(result["complete"])
         self.assertEqual(set(select_by_stream), streams)
+        self.assertTrue(streams.isdisjoint({"Periode", "Sagstype"}))
         self.assertEqual(select_by_stream["Sag"], "id,opdateringsdato,statusid")
         self.assertEqual(select_by_stream["Afstemning"], "id,opdateringsdato,sagstrinid")
         self.assertEqual(set(result["streams"]), streams)

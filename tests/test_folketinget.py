@@ -96,7 +96,7 @@ class URLAndTransportTests(unittest.TestCase):
         self.assertIn("%24filter", url)
 
     def test_only_allowlisted_collections_and_query_options_are_supported(self) -> None:
-        self.assertEqual(COLLECTIONS, {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"})
+        self.assertEqual(COLLECTIONS, {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus", "Periode", "Sagstype"})
         for collection in COLLECTIONS:
             self.assertTrue(build_url(collection, {"$top": 1}).startswith(ODA_ROOT + collection))
         with self.assertRaisesRegex(ValueError, "unsupported"):

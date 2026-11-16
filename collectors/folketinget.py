@@ -21,7 +21,7 @@ DEFAULT_RETRIES = 2
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 COLLECTIONS = frozenset(
-    {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"}
+    {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus", "Periode", "Sagstype"}
 )
 _ALLOWED_PARAMETERS = frozenset({"$filter", "$select", "$orderby", "$top"})
 _TIMESTAMP_RE = re.compile(

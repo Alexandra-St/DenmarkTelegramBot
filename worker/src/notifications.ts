@@ -223,6 +223,7 @@ interface PendingNotification {
   source_name: string;
   external_url: string;
   publication_id: number;
+  source_metadata_json?: string | null;
 }
 
 function clean(value: string, max: number): string {
@@ -252,10 +253,31 @@ function eventLabel(event: PendingNotification, language: Language): string | nu
   return lines.join("\n");
 }
 
+function notificationSourceUrl(event: PendingNotification): string | null {
+  if (event.source_code === "hoeringsportalen") {
+    return validatedOfficialUrl(event.source_code, event.external_url);
+  }
+  if (event.source_code !== "folketinget" || !event.source_metadata_json) return null;
+  try {
+    const metadata = JSON.parse(event.source_metadata_json) as { public_url?: unknown };
+    if (typeof metadata.public_url !== "string") return null;
+    const validated = validatedOfficialUrl("folketinget", metadata.public_url);
+    if (!validated) return null;
+    const url = new URL(validated);
+    return url.hostname === "www.ft.dk"
+        && /^\/samling\/\d{5}\/(?:lovforslag|beslutningsforslag|forespoergsel)\/[lbf]\d+\/index\.htm$/u.test(url.pathname)
+      ? validated
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function formatNotification(event: PendingNotification): string | null {
-  const url = validatedOfficialUrl(event.source_code, event.external_url);
+  const url = notificationSourceUrl(event);
   const change = eventLabel(event, event.language);
-  if (!url || !change) return null;
+  if (!change || (event.source_code === "hoeringsportalen" && !url)
+      || (event.source_code !== "folketinget" && event.source_code !== "hoeringsportalen")) return null;
   const marker = event.relevance === "DIRECT" ? "🟢" : "🟡";
   const disclaimer = event.language === "uk"
     ? "Інформаційне повідомлення, не юридична консультація."
@@ -266,7 +288,7 @@ export function formatNotification(event: PendingNotification): string | null {
     change,
     clean(event.title, 500),
     t(event.language, "sourceLabel") + ": " + clean(event.source_name, 120),
-    url,
+    ...(url ? [url] : []),
     disclaimer,
   ].join("\n\n");
 }
@@ -316,7 +338,9 @@ function publicationBlock(rows: PendingNotification[], number: number): string |
 
 function publicationIsDeliverable(rows: PendingNotification[]): boolean {
   const first = rows[0];
-  return Boolean(validatedOfficialUrl(first.source_code, first.external_url) && publicationChanges(rows).length);
+  const hasRequiredSourceUrl = first.source_code === "folketinget"
+    || Boolean(notificationSourceUrl(first));
+  return Boolean(hasRequiredSourceUrl && publicationChanges(rows).length);
 }
 
 function categoryHeader(relevance: "DIRECT" | "POTENTIAL", language: Language): string {
@@ -344,7 +368,7 @@ function digestText(
 function notificationKeyboard(publications: PendingNotification[][], language: Language): InlineKeyboardMarkup {
   const links = publications.map((rows) => {
     const first = rows[0];
-    const url = validatedOfficialUrl(first.source_code, first.external_url);
+    const url = notificationSourceUrl(first);
     return [{ text: clean(first.title, 48), ...(url ? { url } : {}) }];
   }).filter((row) => "url" in row[0]);
   return {
@@ -434,7 +458,7 @@ async function loadEligiblePendingNotifications(env: NotificationEnv, runId: str
   const result = await env.DB.prepare(`
     SELECT n.id, n.telegram_id, u.language, e.event_type, e.previous_status, e.new_status,
       p.relevance, p.original_title AS title, s.code AS source_code, s.name AS source_name,
-      p.external_url, p.id AS publication_id
+      p.external_url, p.id AS publication_id, p.source_metadata_json
     FROM notifications n
     JOIN users u ON u.telegram_id = n.telegram_id
     JOIN publication_events e ON e.id = n.event_id

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
-from collectors.folketinget import COLLECTIONS, Cursor, ODataClient, ODataError, ODataHTTPError, ODataPageError, ODataPaginationError, ScanResult
+from collectors.folketinget import Cursor, ODataClient, ODataError, ODataHTTPError, ODataPageError, ODataPaginationError, ScanResult
 from collectors.folketinget_models import Diagnostic
 from collectors.folketinget_relations import load_cases
 
@@ -70,7 +70,7 @@ def parse_checkpoints(value: object) -> dict[str, Cursor]:
         raise ValueError("checkpoints must be a JSON object")
     parsed: dict[str, Cursor] = {}
     for name, raw in value.items():
-        if name not in COLLECTIONS or not isinstance(raw, dict):
+        if name not in _STREAM_SELECT or not isinstance(raw, dict):
             raise ValueError("checkpoint entries must use official stream names and objects")
         timestamp, entity_id = raw.get("timestamp"), raw.get("id")
         if not isinstance(timestamp, str) or not _STAMP.fullmatch(timestamp):
@@ -192,8 +192,8 @@ def collect(client: ODataClient, *, mode: str, checkpoints: Mapping[str, Cursor]
         LOGGER.info("ODA stream result stream=%s complete=%s pages=%d records=%d requests=%d elapsed_s=%.3f", name, str(stream_complete).lower(), stream.pages, stream.records, stream.requests, stream.elapsed_seconds)
         return name, stream, tuple(rows), status
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(COLLECTIONS))) as pool:
-        stream_results = list(pool.map(collect_stream, sorted(COLLECTIONS)))
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(_STREAM_SELECT))) as pool:
+        stream_results = list(pool.map(collect_stream, sorted(_STREAM_SELECT)))
     for name, stream, rows, status in stream_results:
         streams[name] = stream
         changes[name] = rows

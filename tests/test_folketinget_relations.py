@@ -131,6 +131,14 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(result.cases[0].source_url, f"{ODA_ROOT}Sag(2)")
         self.assertEqual([item.id for item in result.cases[0].stages], [1, 8])
 
+    def test_public_case_url_uses_confirmed_session_type_and_number_only(self) -> None:
+        source = replace(sag(1), periode_code="20251", sagstype="Lovforslag")
+        result = assemble_cases([source])
+        self.assertEqual(result.cases[0].public_url, "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm")
+        self.assertIsNone(assemble_cases([replace(source, periode_code=None)]).cases[0].public_url)
+        self.assertIsNone(assemble_cases([replace(source, sagstype="Unknown type")]).cases[0].public_url)
+        self.assertIsNone(assemble_cases([replace(source, nummer="FIU alm. del")]).cases[0].public_url)
+
     def test_orphan_stage_and_link_remain_structured_diagnostics(self) -> None:
         result = assemble_cases([sag(1)], stages=[stage(2, 99)], document_links=[link(3, 99, 7)])
         self.assertEqual({item.code for item in result.diagnostics}, {"orphan_stage", "orphan_document_link"})
@@ -139,7 +147,7 @@ class AssemblyTests(unittest.TestCase):
 class HydrationTests(unittest.TestCase):
     def make_client(self, *, failing_collection: str | None = None, doc_count: int = 1) -> Mock:
         client = Mock()
-        base = {"id": 1, "nummer": "L 1", "titel": "Forslag", "statusid": 25, "typeid": 3, "kategoriid": 13, "opdateringsdato": STAMP}
+        base = {"id": 1, "nummer": "L 1", "titel": "Forslag", "statusid": 25, "typeid": 3, "kategoriid": 13, "periodeid": 501, "opdateringsdato": STAMP}
         client.fetch_page.side_effect = lambda collection, params: (
             [base] if collection == "Sag" else ([{"id": 25, "status": "Vedtaget", "opdateringsdato": STAMP}] if collection == "Sagsstatus" else [])
         )
@@ -148,12 +156,16 @@ class HydrationTests(unittest.TestCase):
         docs = [{"id": item["dokumentid"], "titel": f"Dokument {item['dokumentid']}", "opdateringsdato": STAMP} for item in links]
         votes = [{"id": 31, "sagstrinid": 10, "nummer": 1, "vedtaget": True, "opdateringsdato": STAMP}]
 
-        def scan(collection: str, *, filter: str) -> ScanResult:
+        def scan(collection: str, *, filter: str, select: str | None = None, max_pages: int | None = None) -> ScanResult:
             if collection == failing_collection:
                 partial_rows = stages if collection == "Sagstrin" else []
                 partial = successful_scan(partial_rows, page_count=1 if partial_rows else 0)
                 raise ODataPageError(2, replace(partial, metadata=replace(partial.metadata, complete=False)), "HTTP 503")
-            if collection == "Sagstrin":
+            if collection == "Periode":
+                selected = [{"id": 501, "kode": "20251", "type": "samling", "opdateringsdato": STAMP}]
+            elif collection == "Sagstype":
+                selected = [{"id": 3, "type": "Lovforslag", "opdateringsdato": STAMP}]
+            elif collection == "Sagstrin":
                 selected = stages
             elif collection == "SagDokument":
                 selected = links
@@ -181,19 +193,20 @@ class HydrationTests(unittest.TestCase):
         payload = result.case.to_dict()  # type: ignore[union-attr]
         self.assertEqual(payload["source_url"], f"{ODA_ROOT}Sag(1)")
         self.assertEqual(payload["type_id"], 3)
+        self.assertEqual(payload["public_url"], "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm")
         self.assertIn('"source": "folketinget"', json.dumps(payload, ensure_ascii=False))
 
     def test_related_scan_result_can_contain_multiple_pages(self) -> None:
         client = self.make_client()
         previous_scan = client.scan.side_effect
 
-        def with_two_stages(collection: str, *, filter: str) -> ScanResult:
+        def with_two_stages(collection: str, *, filter: str, select: str | None = None, max_pages: int | None = None) -> ScanResult:
             if collection == "Sagstrin":
                 return successful_scan([
                     {"id": 10, "sagid": 1, "opdateringsdato": STAMP},
                     {"id": 11, "sagid": 1, "opdateringsdato": "2026-10-15T00:00:00"},
                 ], page_count=2)
-            return previous_scan(collection, filter=filter)
+            return previous_scan(collection, filter=filter, select=select, max_pages=max_pages)
 
         client.scan.side_effect = with_two_stages
         result = load_case(client, 1)
@@ -303,7 +316,7 @@ class HydrationTests(unittest.TestCase):
         self.assertIn("HTTP_400", diagnostics[0].message)
 
     def test_bulk_hydration_preserves_relationships_with_bounded_query_count(self) -> None:
-        cases = [sag(index, statusid=25) for index in (1, 2, 3)]
+        cases = [sag(index, statusid=25, periodeid=501) for index in (1, 2, 3)]
         stages = [stage(100 + item.id, item.id) for item in cases]
         links = [link(200 + item.id, item.id, 300 + item.id) for item in cases]
         docs = [document(300 + item.id) for item in cases]
@@ -316,6 +329,8 @@ class HydrationTests(unittest.TestCase):
             "Dokument": [asdict(item) for item in docs],
             "Afstemning": [asdict(item) for item in votes],
             "Sagsstatus": [asdict(item) for item in status_rows],
+            "Periode": [{"id": 501, "kode": "20251", "type": "samling", "opdateringsdato": STAMP}],
+            "Sagstype": [{"id": 3, "type": "Lovforslag", "opdateringsdato": STAMP}],
         }
         class BulkClient:
             calls = 0
@@ -333,12 +348,12 @@ class HydrationTests(unittest.TestCase):
         self.assertEqual([item.external_id for item in result.cases], ["1", "2", "3"])
         self.assertTrue(all(item.status.name == "Vedtaget" for item in result.cases))
         self.assertTrue(all(len(item.documents) == 1 and len(item.votes) == 1 for item in result.cases))
-        self.assertEqual(client.calls, 6, "bulk lookup uses six OData scans for these cases")
+        self.assertEqual(client.calls, 8, "bulk lookup includes the two public-route lookups")
 
     def test_bulk_hydration_failure_keeps_partial_case_but_marks_run_incomplete(self) -> None:
         datasets = {
-            "Sag": [{"id": 1, "nummer": "L 1", "titel": "Proposal", "typeid": 1, "kategoriid": 1, "statusid": None, "retsinformationsurl": None, "opdateringsdato": STAMP}],
-            "Sagstrin": [], "SagDokument": [], "Dokument": [], "Afstemning": [], "Sagsstatus": [],
+            "Sag": [{"id": 1, "nummer": "L 1", "titel": "Proposal", "typeid": 1, "kategoriid": 1, "periodeid": None, "statusid": None, "retsinformationsurl": None, "opdateringsdato": STAMP}],
+            "Sagstrin": [], "SagDokument": [], "Dokument": [], "Afstemning": [], "Sagsstatus": [], "Periode": [], "Sagstype": [],
         }
 
         class FailingBulkClient:

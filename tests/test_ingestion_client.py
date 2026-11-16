@@ -100,6 +100,27 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(row["normalized_snapshot"]["stages"][0]["id"], 7)
         self.assertEqual(row["normalized_snapshot"]["votes"][0]["id"], 9)
 
+    def test_folketinget_public_url_is_persisted_only_when_it_matches_supported_route(self):
+        value = oda_output()
+        value["cases"][0]["public_url"] = "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm"
+        row = prepare_records(value, "folketinget", "incremental")[0]
+        self.assertEqual(row["source_metadata"]["public_url"], "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm")
+
+        for invalid in (
+            "https://oda.ft.dk/api/Sag(42)",
+            "https://ft.dk/samling/20251/lovforslag/l1/index.htm",
+            "https://www.ft.dk/samling/not-a-session/lovforslag/l1/index.htm",
+        ):
+            bad_value = oda_output()
+            bad_value["cases"][0]["public_url"] = invalid
+            prepared = prepare_records(bad_value, "folketinget", "incremental")[0]
+            self.assertNotIn("public_url", prepared["source_metadata"])
+            self.assertEqual(prepared["url"], "https://oda.ft.dk/api/Sag(42)")
+
+        incomplete_route = oda_output()
+        incomplete_route["cases"][0].pop("public_url", None)
+        self.assertNotIn("public_url", prepare_records(incomplete_route, "folketinget", "incremental")[0]["source_metadata"])
+
     def test_collection_must_be_complete_before_any_submission(self):
         value = hearing_output()
         value["feeds"]["immigration_category"]["invalid_timestamps"] = 1

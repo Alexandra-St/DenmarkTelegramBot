@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Mapping, Sequence, TypeVar
@@ -84,6 +85,22 @@ def _deduplicate(records: Iterable[_Model], entity: str) -> tuple[dict[int, _Mod
 
 def _diag(code: str, entity: str, message: str, *, entity_id: int | None = None, related_id: int | None = None) -> Diagnostic:
     return Diagnostic(code, entity, message, entity_id, related_id)
+
+
+_PUBLIC_ROUTE_TYPES = {
+    "Lovforslag": ("lovforslag", "L"),
+    "Beslutningsforslag": ("beslutningsforslag", "B"),
+    "Forespørgsel": ("forespoergsel", "F"),
+}
+
+
+def _public_case_url(sag: Sag) -> str | None:
+    route = _PUBLIC_ROUTE_TYPES.get(sag.sagstype or "")
+    number = re.fullmatch(r"\s*([LBF])\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
+    if (route is None or number is None or number.group(1).upper() != route[1]
+            or not re.fullmatch(r"\d{5}", sag.periode_code or "")):
+        return None
+    return f"https://www.ft.dk/samling/{sag.periode_code}/{route[0]}/{route[1].lower()}{number.group(2)}/index.htm"
 
 
 def assemble_cases(
@@ -224,6 +241,7 @@ def assemble_cases(
                 documents=tuple(sorted(document_models, key=lambda item: (item.link_id, item.id))),
                 votes=vote_models,
                 complete=complete,
+                public_url=_public_case_url(sag),
             )
         )
 
@@ -284,7 +302,9 @@ def _chunks(values: Sequence[int], size: int = 50) -> Iterable[Sequence[int]]:
 
 
 _PROJECTIONS = {
-    "Sag": "id,nummer,titel,statusid,typeid,kategoriid,opdateringsdato,retsinformationsurl",
+    "Sag": "id,nummer,titel,statusid,typeid,kategoriid,periodeid,opdateringsdato,retsinformationsurl",
+    "Periode": "id,kode,type,opdateringsdato",
+    "Sagstype": "id,type,opdateringsdato",
     "Sagstrin": "id,sagid,titel,dato,typeid,statusid,opdateringsdato",
     "SagDokument": "id,sagid,dokumentid,bilagsnummer,frigivelsesdato,rolleid,opdateringsdato",
     "Dokument": "id,titel,dato,modtagelsesdato,frigivelsesdato,opdateringsdato",
@@ -400,6 +420,35 @@ def _bulk_scan_groups(
     return rows, diagnostics, complete
 
 
+def _enrich_public_route_fields(
+    client: ODataClient,
+    sags: Sequence[Sag],
+    *,
+    workers: int,
+    batch_size: int,
+) -> list[Sag]:
+    period_ids = {item.periodeid for item in sags if item.periodeid is not None}
+    type_ids = {item.typeid for item in sags if item.typeid is not None}
+    period_rows, _, _ = _bulk_scan_groups(
+        client, "Periode", "id", {item: {item} for item in period_ids}, workers=workers, batch_size=batch_size,
+    )
+    type_rows, _, _ = _bulk_scan_groups(
+        client, "Sagstype", "id", {item: {item} for item in type_ids}, workers=workers, batch_size=batch_size,
+    )
+    period_codes = {
+        int(row["id"]): row["kode"]
+        for row in period_rows
+        if isinstance(row.get("id"), int) and row.get("type") == "samling"
+        and isinstance(row.get("kode"), str) and re.fullmatch(r"\d{5}", row["kode"])
+    }
+    type_names = {
+        int(row["id"]): row["type"]
+        for row in type_rows
+        if isinstance(row.get("id"), int) and isinstance(row.get("type"), str)
+    }
+    return [replace(item, periode_code=period_codes.get(item.periodeid or -1), sagstype=type_names.get(item.typeid or -1)) for item in sags]
+
+
 def load_cases(
     client: ODataClient,
     case_ids: Sequence[int],
@@ -425,6 +474,7 @@ def load_cases(
     sag_batch = _as_batch(raw_sags, "Sag")
     diagnostics.extend(sag_batch.diagnostics)
     sags = [item for item in (sag_batch.record or ()) if isinstance(item, Sag) and item.id in case_mapping]
+    sags = _enrich_public_route_fields(client, sags, workers=workers, batch_size=batch_size)
     sag_ids = {item.id for item in sags}
     for missing_id in sorted(set(ids) - sag_ids):
         diagnostics.append(_diag("case_not_found", "Sag", "requested case was not returned", entity_id=missing_id))
@@ -512,6 +562,7 @@ def load_case(client: ODataClient, case_id: int) -> HydrationResult:
     if not sags:
         diagnostics.append(_diag("case_not_found", "Sag", "requested case was not returned", entity_id=case_id))
         return HydrationResult(None, tuple(diagnostics), False)
+    sags = _enrich_public_route_fields(client, sags, workers=1, batch_size=40)
 
     raw_stages, stages_complete, found = _safe_scan(client, "Sagstrin", f"sagid eq {case_id}", case_id)
     diagnostics.extend(found)

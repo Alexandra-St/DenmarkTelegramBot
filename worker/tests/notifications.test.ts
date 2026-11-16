@@ -564,6 +564,66 @@ test("localized message includes change, relevance, title, source, official URL,
   assert.match(ru ?? "", /не юридическая консультация/u);
 });
 
+test("Folketinget notifications prefer trusted public URLs and omit legacy ODA endpoints", () => {
+  const folketinget = {
+    id: 1, telegram_id: 1, language: "uk" as const, event_type: "TITLE_CHANGED",
+    previous_status: null, new_status: null, relevance: "DIRECT" as const, title: "Danish bill",
+    source_code: "folketinget", source_name: "Folketinget", external_url: "https://oda.ft.dk/api/Sag(42)",
+  };
+  const publicUrl = "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm";
+  const rendered = formatNotification({ ...folketinget, source_metadata_json: JSON.stringify({ public_url: publicUrl }) });
+  assert.match(rendered ?? "", /https:\/\/www\.ft\.dk\/samling\/20251\/lovforslag\/l1\/index\.htm/u);
+  assert.doesNotMatch(rendered ?? "", /oda\.ft\.dk\/api/u);
+
+  const legacy = formatNotification(folketinget);
+  assert.ok(legacy);
+  assert.doesNotMatch(legacy, /oda\.ft\.dk\/api/u);
+  assert.doesNotMatch(legacy, /www\.ft\.dk/u);
+});
+
+test("delivery renders Folketinget metadata links and keeps legacy API URLs private", async () => {
+  const db = await fixture();
+  try {
+    const current = await addEvent(db, { id: "ft-public-link", source: "folketinget", url: "https://oda.ft.dk/api/Sag(42)" });
+    const legacy = await addEvent(db, { id: "ft-legacy-link", source: "folketinget", url: "https://oda.ft.dk/api/Sag(43)" });
+    await db.prepare("UPDATE publications SET source_metadata_json = ? WHERE external_id = 'ft-public-link'")
+      .bind(JSON.stringify({ public_url: "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm" })).run();
+    for (const eventId of [current, legacy]) {
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+    }
+    const messages: Array<{
+      id: number;
+      text: string;
+      keyboard: { inline_keyboard: Array<Array<{ text: string; url?: string; callback_data?: string }>> };
+      preview?: { is_disabled: boolean };
+    }> = [];
+    const result = await deliverPendingNotifications({
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
+    }, {
+      async sendMessage(id, text, keyboard, preview) {
+        messages.push({
+          id,
+          text,
+          keyboard: keyboard as typeof messages[number]["keyboard"],
+          preview,
+        });
+      },
+    }, TEST_RUN_ID, now);
+    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0, remaining: 0 });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].id, 1);
+    assert.match(messages[0].text, /Test publication ft-public-link/u);
+    assert.match(messages[0].text, /Test publication ft-legacy-link/u);
+    assert.doesNotMatch(messages[0].text, /oda\.ft\.dk\/api/u);
+    const buttons = messages[0].keyboard.inline_keyboard.flat();
+    const urlButtons = buttons.filter((button) => button.url);
+    assert.equal(urlButtons.length, 1);
+    assert.equal(urlButtons[0].url, "https://www.ft.dk/samling/20251/lovforslag/l1/index.htm");
+    assert.deepEqual(messages[0].preview, { is_disabled: true });
+  } finally { db.close(); }
+});
+
 test("invalid official URLs and unknown change types fail closed", () => {
   const event = {
     id: 1, telegram_id: 1, language: "uk" as const, event_type: "TITLE_CHANGED",

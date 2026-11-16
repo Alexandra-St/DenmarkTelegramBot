@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from collectors.relevance import RULESET_VERSION, classify
 
@@ -25,7 +26,22 @@ ODA_STREAMS = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sags
 HEARING_FEEDS = ("immigration_ministry", "immigration_category")
 _UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?(?:Z|[+-]\d\d:\d\d)$")
 _ODA = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?$")
+_FOLKETINGET_PUBLIC_PATH = re.compile(r"^/samling/\d{5}/(?:lovforslag|beslutningsforslag|forespoergsel)/[lbf]\d+/index\.htm$")
 Opener = Callable[..., Any]
+
+
+def _validated_folketinget_public_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or parsed.hostname != "www.ft.dk" or parsed.port not in (None, 443)
+                or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+                or not _FOLKETINGET_PUBLIC_PATH.fullmatch(parsed.path)):
+            return None
+    except ValueError:
+        return None
+    return value
 
 
 class IngestionError(ValueError):
@@ -118,6 +134,9 @@ def prepare_records(value: object, source: str, mode: str, run_diagnostics: obje
                 "status_id": status_obj.get("id"), "source_updated_at_raw": raw_updated,
                 "updated_at_utc": updated, "legal_url": row.get("legal_url"),
             }
+            public_url = _validated_folketinget_public_url(row.get("public_url"))
+            if public_url:
+                metadata["public_url"] = public_url
             if not isinstance(url, str):
                 raise IngestionError("Folketinget case has no official source URL")
         if not isinstance(url, str):
