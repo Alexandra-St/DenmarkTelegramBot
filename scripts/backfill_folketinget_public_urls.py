@@ -54,6 +54,41 @@ def _load_url_validator() -> Callable[[object], str | None]:
     return _validated_folketinget_public_url
 
 
+def _validated_public_url(
+    value: object, audit: Mapping[str, Any] | None = None, *, expected_sag_id: int | None = None,
+) -> str | None:
+    """Validate legacy routes normally and newer routes against router output."""
+    validated = _load_url_validator()(value)
+    if validated is not None:
+        return validated
+    if not isinstance(value, str) or not isinstance(audit, Mapping):
+        return None
+
+    from collectors.folketinget_models import Sag
+    from collectors.folketinget_relations import _public_case_url
+
+    sag_id = audit.get("sag_id")
+    if isinstance(sag_id, bool) or not isinstance(sag_id, int) or sag_id <= 0:
+        return None
+    if expected_sag_id is not None and sag_id != expected_sag_id:
+        return None
+    sag = Sag(
+        id=sag_id,
+        nummer=audit.get("number") if isinstance(audit.get("number"), str) else None,
+        titel=None,
+        typeid=audit.get("type_id") if isinstance(audit.get("type_id"), int) else None,
+        kategoriid=None,
+        statusid=None,
+        opdateringsdato=None,
+        updated_at_utc=None,
+        retsinformationsurl=None,
+        periodeid=audit.get("periode_id") if isinstance(audit.get("periode_id"), int) else None,
+        periode_code=audit.get("periode_code") if isinstance(audit.get("periode_code"), str) else None,
+        sagstype=audit.get("sagstype") if isinstance(audit.get("sagstype"), str) else None,
+    )
+    return value if _public_case_url(sag) == value else None
+
+
 def _safe_stderr(stderr: object) -> str:
     if not isinstance(stderr, str):
         return ""
@@ -290,9 +325,7 @@ def resolve_oda_routes(
     """Read only Sag rows plus their Periode/Sagstype lookups for candidate IDs."""
     from collectors.folketinget import ODataClient
     from collectors.folketinget_models import Sag, normalize_many
-    from collectors.folketinget_relations import _PUBLIC_ROUTE_TYPES, _public_case_url
-
-    validator = _load_url_validator()
+    from collectors.folketinget_relations import _public_case_url
     candidates: dict[str, Mapping[str, Any]] = {}
     for row in publications:
         external_id = row.get("external_id")
@@ -346,17 +379,19 @@ def resolve_oda_routes(
             reason = "missing_number"
         elif not sag.nummer.strip():
             reason = "empty_number"
-        elif sag.sagstype not in _PUBLIC_ROUTE_TYPES:
-            reason = "missing_sagstype_id" if sag.typeid is None else ("sagstype_not_found" if not audit["sagstype_found"] else "unsupported_sagstype")
+        elif sag.typeid is None:
+            reason = "missing_sagstype_id"
+        elif not audit["sagstype_found"]:
+            reason = "sagstype_not_found"
         else:
             url = _public_case_url(sag)
-            validated = validator(url)
+            validated = _validated_public_url(url, audit) if url is not None else None
             if validated:
                 resolutions[external_id] = RouteResolution(validated, audit=audit)
                 continue
-            number = re.fullmatch(r"\s*([LBF])\s*(\d+)\s*", sag.nummer or "", flags=re.IGNORECASE)
-            route_prefix = _PUBLIC_ROUTE_TYPES.get(sag.sagstype or "", ("", ""))[1]
-            reason = "route_invalid_number" if number is None else ("number_type_mismatch" if number.group(1).upper() != route_prefix else "route_validation_failure")
+            # Route eligibility belongs to the canonical router; this is a
+            # diagnostic only and does not maintain a second supported-type list.
+            reason = "unsupported_sagstype" if url is None else "route_validation_failure"
         resolutions[external_id] = RouteResolution(None, reason, audit, {"detail": reason})
     return resolutions
 
@@ -383,7 +418,6 @@ def build_manifest(
         else:
             candidates.append(row)
 
-    validator = _load_url_validator()
     records: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
     for row in candidates:
@@ -412,7 +446,7 @@ def build_manifest(
             })
             continue
         assert resolution is not None
-        url = validator(resolution.public_url)
+        url = _validated_public_url(resolution.public_url, resolution.audit, expected_sag_id=int(external_id))
         original = row.get("source_metadata_json")
         metadata = _json_object(original)
         external_url = row.get("external_url")
@@ -481,7 +515,6 @@ def validate_manifest(value: object) -> dict[str, Any]:
     skipped_records = value.get("skipped_records")
     if not isinstance(skipped_records, list):
         raise ValueError("manifest skipped_records must be a list")
-    validator = _load_url_validator()
     seen: set[int] = set()
     for row in records:
         if not isinstance(row, dict):
@@ -492,7 +525,8 @@ def validate_manifest(value: object) -> dict[str, Any]:
         if (isinstance(pub_id, bool) or not isinstance(pub_id, int) or pub_id <= 0 or pub_id in seen
                 or row.get("source_code") != "folketinget" or not isinstance(external_id, str) or not _SAG_ID.fullmatch(external_id)
                 or not isinstance(external_url, str) or metadata is None or "public_url" in metadata
-                or validator(public_url) != public_url or not isinstance(row.get("oda_audit"), dict)):
+                or not isinstance(row.get("oda_audit"), dict)
+                or _validated_public_url(public_url, row.get("oda_audit"), expected_sag_id=int(external_id)) != public_url):
             raise ValueError("invalid or unsafe manifest record")
         seen.add(pub_id)
     return value

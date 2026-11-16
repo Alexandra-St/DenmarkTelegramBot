@@ -281,6 +281,61 @@ class BackfillTests(unittest.TestCase):
         self.assertIn(("Sag", (42,), 1), calls)
         self.assertEqual(sum(1 for collection, *_ in calls if collection == "Sag"), 2)
 
+    def test_router_supported_s20_and_aktstykke_routes_are_planned_and_apply_safely(self):
+        sag_rows = [
+            {"id": 42, "nummer": "S 601", "titel": "Question", "typeid": 5, "kategoriid": 15,
+             "statusid": 1, "periodeid": 9, "opdateringsdato": None},
+            {"id": 43, "nummer": "Aktstk. 176", "titel": "Appropriation", "typeid": 6, "kategoriid": 15,
+             "statusid": 1, "periodeid": 9, "opdateringsdato": None},
+            {"id": 44, "nummer": "F 8", "titel": "Unsupported", "typeid": 7, "kategoriid": 15,
+             "statusid": 1, "periodeid": 9, "opdateringsdato": None},
+        ]
+
+        def fake_bulk(_client, collection, _field, mapping, *, workers, batch_size):
+            if collection == "Sag":
+                return sag_rows, [], True
+            if collection == "Periode":
+                return [{"id": 9, "kode": "20241", "type": "samling"}], [], True
+            if collection == "Sagstype":
+                return [
+                    {"id": 5, "type": "§ 20-spørgsmål"},
+                    {"id": 6, "type": "Aktstykke"},
+                    {"id": 7, "type": "Forslag til vedtagelse"},
+                ], [], True
+            raise AssertionError(collection)
+
+        rows = [publication(1, "42"), publication(2, "43"), publication(3, "44")]
+        with patch("collectors.folketinget_relations._bulk_scan_groups", side_effect=fake_bulk):
+            resolutions = resolve_oda_routes(rows, client=object())
+
+        expected = {
+            "42": "https://www.ft.dk/samling/20241/spoergsmaal/S601/index.htm",
+            "43": "https://www.ft.dk/samling/20241/aktstykke/aktstk.176/index.htm",
+        }
+        for external_id, public_url in expected.items():
+            with self.subTest(external_id=external_id):
+                self.assertEqual(resolutions[external_id].public_url, public_url)
+        self.assertEqual(resolutions["44"].public_url, None)
+        self.assertEqual(resolutions["44"].reason, "unsupported_sagstype")
+
+        manifest = build_manifest(rows, resolutions)
+        self.assertEqual(len(manifest["records"]), 2)
+        self.assertEqual(len(manifest["skipped_records"]), 1)
+        self.assertEqual(manifest["summary"]["planned_updates"], 2)
+        self.assertEqual(manifest["summary"]["skipped"], 1)
+        self.assertEqual({row["external_id"]: row["public_url"] for row in manifest["records"]}, expected)
+        self.assertEqual(manifest["skipped_records"][0]["external_id"], "44")
+        validate_manifest(manifest)
+        tampered = {**manifest, "records": [dict(row) for row in manifest["records"]]}
+        tampered["records"][0]["oda_audit"] = {**manifest["records"][0]["oda_audit"], "sag_id": 999}
+        with self.assertRaisesRegex(ValueError, "invalid or unsafe manifest record"):
+            validate_manifest(tampered)
+
+        store = FakeStore(rows)
+        self.assertEqual(apply_manifest(manifest, store), {"applied": 2})
+        self.assertEqual(rollback_manifest(manifest, store), {"rolled_back": 2})
+        self.assertEqual(store.publication_writes, 4)
+
     def test_failed_fallback_stays_skipped_with_bounded_lookup_diagnostic(self):
         from collectors.folketinget_models import Diagnostic
 
